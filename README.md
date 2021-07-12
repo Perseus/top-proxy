@@ -1,5 +1,7 @@
 # top-proxy
 
+![example workflow](https://github.com/Perseus/top-proxy/actions/workflows/rust.yml/badge.svg)
+
 Meant to serve as a middleman between game clients and the gateserver and do the following ->
 
 * Filter unwanted traffic
