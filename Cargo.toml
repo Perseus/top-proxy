@@ -1,5 +1,5 @@
 [package]
-name = "top-proxy"
+name = "top_proxy"
 version = "0.1.0"
 authors = ["Perseus"]
 edition = "2018"
@@ -13,3 +13,4 @@ termcolor = "1.1.2"
 bytes = "1.0.1"
 byteorder = "1.4.3"
 num_enum = "0.5.1"
+anyhow = "1.0"

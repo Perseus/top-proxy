@@ -2,6 +2,9 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
+use std::fmt::Write;
+use std::io::Cursor;
+use std::io::Error;
 use std::iter::FromIterator;
 use std::{io::Read, mem::size_of};
 
@@ -10,9 +13,16 @@ use std::{io::Read, mem::size_of};
 pub enum Command {
     None,
     BridgeChatLogs = 1514,
+    EstablishClientConnection = 940,
 }
 
 const DEFAULT_HEADER: u32 = 2147483648;
+
+#[derive(Debug, PartialEq)]
+pub enum FrameError {
+    Incomplete,
+    Invalid,
+}
 
 pub trait PacketReader {
     fn read_cmd(&mut self) -> Option<Command>;
@@ -29,22 +39,31 @@ pub trait PacketReader {
 }
 
 pub trait PacketWriter {
-    fn write_buffer(&mut self, buffer: Vec<u8>) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_cmd(&mut self, cmd: Command) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_char(&mut self, char: u8) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_short(&mut self, data: u16) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_long(&mut self, data: u32) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_long_long(&mut self, data: u64) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_sequence(
-        &mut self,
-        sequence: &[u8],
-        len: u16,
-    ) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_string(&mut self, string: &str) -> Result<(), Box<dyn std::error::Error>>;
-    fn write_float(&mut self, data: f32) -> Result<(), Box<dyn std::error::Error>>;
-    fn build_packet(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+    fn write_buffer(&mut self, buffer: Vec<u8>) -> anyhow::Result<()>;
+    fn write_cmd(&mut self, cmd: Command) -> anyhow::Result<()>;
+    fn write_char(&mut self, char: u8) -> anyhow::Result<()>;
+    fn write_short(&mut self, data: u16) -> anyhow::Result<()>;
+    fn write_long(&mut self, data: u32) -> anyhow::Result<()>;
+    fn write_long_long(&mut self, data: u64) -> anyhow::Result<()>;
+    fn write_sequence(&mut self, sequence: &[u8], len: u16) -> anyhow::Result<()>;
+    fn write_string(&mut self, string: &str) -> anyhow::Result<()>;
+    fn write_float(&mut self, data: f32) -> anyhow::Result<()>;
+    fn build_packet(&mut self) -> anyhow::Result<()>;
 }
 
+/**
+    The structure of a packet is ->
+
+    First 2 bytes -> Length of the packet
+    Next 4 bytes -> Header
+
+    The first 6 bytes ^ are in BigEndian while everything else is in LittleEndian
+
+    Next 2 bytes -> Command
+    The rest of the bytes are datapoints related to the command in the form of
+    different data types (strings, floats, longs etc)
+
+*/
 #[derive(Debug, Clone)]
 pub struct Packet {
     data: BytesMut,
@@ -121,12 +140,43 @@ impl Packet {
         true
     }
 
+    pub fn get_as_bytes(self) -> BytesMut {
+        self.data
+    }
+
     pub fn duplicate(&self) -> Self {
         let mut packet = self.clone();
         packet.offset = 8; // size, header data and command have already been read
         packet.reverse_offset = 0;
 
         packet
+    }
+
+    pub fn check_frame(buffer: &mut Cursor<&[u8]>) -> Result<usize, FrameError> {
+        // if we don't have at least enough data for a "packet length" frame, we return false
+        let packet_length = buffer
+            .read_u16::<BigEndian>()
+            .or(Err(FrameError::Incomplete))?;
+
+        println!(
+            "packet length foudn - {}, buffer remaining - {}",
+            packet_length,
+            buffer.remaining()
+        );
+
+        if buffer.remaining() < (packet_length as usize - 2) {
+            return Err(FrameError::Incomplete);
+        }
+
+        Ok(packet_length as usize)
+    }
+
+    // this function assumes that the data in the buffer has been previously checked by the `check_frame` function
+    // never use this without using check_frame
+    pub fn parse_frame(buffer: &mut BytesMut, len: usize) -> Result<Self, FrameError> {
+        // let packet = Packet::from_bytes
+        let final_buffer = BytesMut::from_iter(&buffer[0..len]);
+        Ok(Packet::from_bytes(final_buffer))
     }
 }
 
@@ -328,7 +378,7 @@ impl PacketReader for Packet {
 }
 
 impl PacketWriter for Packet {
-    fn write_buffer(&mut self, mut buffer: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_buffer(&mut self, mut buffer: Vec<u8>) -> anyhow::Result<()> {
         println!("buffer len is - {}, buffer is - {:?}", buffer.len(), buffer);
 
         for _ in 0..buffer.len() {
@@ -341,7 +391,7 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_cmd(&mut self, cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_cmd(&mut self, cmd: Command) -> anyhow::Result<()> {
         let command: u16 = cmd.into();
         let mut buf: Vec<u8> = vec![0; 2];
 
@@ -353,13 +403,13 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_char(&mut self, char: u8) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_char(&mut self, char: u8) -> anyhow::Result<()> {
         self.write_buffer(vec![char])?;
 
         Ok(())
     }
 
-    fn write_short(&mut self, data: u16) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_short(&mut self, data: u16) -> anyhow::Result<()> {
         let mut buf = vec![0; 2];
 
         LittleEndian::write_u16(&mut buf[..], data);
@@ -369,7 +419,7 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_long(&mut self, data: u32) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_long(&mut self, data: u32) -> anyhow::Result<()> {
         let mut buf = vec![0; 4];
 
         LittleEndian::write_u32(&mut buf[..], data);
@@ -378,7 +428,7 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_long_long(&mut self, data: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_long_long(&mut self, data: u64) -> anyhow::Result<()> {
         let mut buf = vec![0; 8];
 
         LittleEndian::write_u64(&mut buf[..], data);
@@ -387,7 +437,7 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_float(&mut self, data: f32) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_float(&mut self, data: f32) -> anyhow::Result<()> {
         let mut buf = vec![0; 4];
 
         LittleEndian::write_f32(&mut buf[..], data);
@@ -396,11 +446,7 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_sequence(
-        &mut self,
-        sequence: &[u8],
-        len: u16,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_sequence(&mut self, sequence: &[u8], len: u16) -> anyhow::Result<()> {
         let mut buf = Vec::with_capacity(len as usize);
 
         println!("len - {}", len);
@@ -419,17 +465,17 @@ impl PacketWriter for Packet {
         Ok(())
     }
 
-    fn write_string(&mut self, string: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_string(&mut self, string: &str) -> anyhow::Result<()> {
         self.write_sequence(string.as_bytes(), string.len() as u16)?;
 
         Ok(())
     }
 
-    fn build_packet(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn build_packet(&mut self) -> anyhow::Result<()> {
         let size = (self.data.len() + 4 + 2) as u16; // total data + header + length of the size data itself
 
-        let size_buf = size.to_le_bytes().to_vec();
-        let header_buf = self.header.to_le_bytes().to_vec();
+        let size_buf = size.to_be_bytes().to_vec();
+        let header_buf = self.header.to_be_bytes().to_vec();
 
         let full_buf = [size_buf, header_buf].concat();
 
@@ -447,10 +493,7 @@ impl PacketWriter for Packet {
 
 #[cfg(test)]
 mod test {
-    use core::num;
     use std::iter::FromIterator;
-
-    use bytes::BufMut;
 
     use super::*;
 
